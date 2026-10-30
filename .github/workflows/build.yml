@@ -1,0 +1,22 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make build
+      - name: Help output
+        run: ./bin/screenflare-ctl --help >/dev/null
+      - name: Reject a missing Screenflare
+        run: |
+          # `doctor` must exit 3 (app not running) on a runner with no Screenflare,
+          # and still print parseable JSON.
+          ./bin/screenflare-ctl doctor --json > /tmp/doctor.json && exit 1 || true
+          python3 -c "import json;d=json.load(open('/tmp/doctor.json'));assert d['ok'] is False;assert d['error']['code'] in ('app_not_running','no_menu_bar')"
