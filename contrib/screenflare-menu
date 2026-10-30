@@ -1,0 +1,254 @@
+#!/bin/sh
+# screenflare-menu — press a Screenflare menu item through System Events.
+#
+# Screenflare 0.1.24 ships no URL scheme, AppleScript dictionary, CLI or
+# Shortcuts action, so its menu bar is the only automation hook. Menu titles are
+# read from the app's own localization, so a non-English UI works too.
+#
+# Kept as the zero-install fallback for hosts that only have System Events.
+# `screenflare-ctl` next to it does the same thing through the Accessibility API:
+# ~5 ms instead of three osascript launches, no Apple Events grant, and it can
+# report the artifact. Prefer it whenever a binary is acceptable.
+#
+# Usage:
+#   screenflare-menu [--check] [--wait SECONDS] <action>
+#
+# Actions:
+#   captureArea        Capture Screenshot   (region overlay; Space = window)
+#   captureWindow      Capture Window
+#   captureFullscreen  Capture Fullscreen
+#   captureText        Capture Text        (OCR to clipboard)
+#   scrollingCapture   Scrolling Capture
+#   recordWindow       Record Window
+#   recordArea         Record Area
+#   recordDisplay      Record Display
+#   stopRecording      Stop Recording
+#   captureBar         Record or Capture…
+#   screenshotHistory  Screenshot History…
+#   recordingHistory   Recording History…
+#
+#   --check   resolve the localized titles and report whether the item is
+#             enabled, without clicking anything
+#   --wait N  seconds to wait for the menu to appear (default 10)
+#
+# Exit status: 0 on success (or a passing --check), 1 on any failure.
+
+set -eu
+
+# OpenLogi's agent runs this through /bin/sh with a bare environment.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+APP=/Applications/Screenflare.app
+RES="$APP/Contents/Resources"
+BUNDLE_ID=app.screenflare
+PLUTIL=/usr/bin/plutil
+OSASCRIPT=/usr/bin/osascript
+
+CHECK=0
+WAIT=10
+ACTION=
+
+usage() {
+	sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'
+	exit "${1:-0}"
+}
+
+while [ $# -gt 0 ]; do
+	case $1 in
+	--check) CHECK=1 ;;
+	--wait)
+		[ $# -ge 2 ] || { echo "screenflare-menu: --wait needs a number of seconds" >&2; exit 1; }
+		WAIT=$2
+		shift
+		;;
+	-h | --help) usage 0 ;;
+	-*) echo "screenflare-menu: unknown option $1" >&2; exit 1 ;;
+	*)
+		[ -z "$ACTION" ] || { echo "screenflare-menu: only one action at a time" >&2; exit 1; }
+		ACTION=$1
+		;;
+	esac
+	shift
+done
+
+[ -n "$ACTION" ] || usage 1
+[ -d "$APP" ] || { echo "screenflare-menu: $APP is not installed" >&2; exit 1; }
+
+# ── Menu paths, keyed by the app's own localization keys ─────────────────────
+
+menu_keys() {
+	case $1 in
+	captureArea) printf '%s\n%s\n' menu.file menu.file.captureScreenshot ;;
+	captureWindow) printf '%s\n%s\n' menu.file menu.file.captureWindow ;;
+	captureFullscreen) printf '%s\n%s\n' menu.file menu.file.captureFullscreen ;;
+	captureText) printf '%s\n%s\n' menu.file menu.file.captureText ;;
+	scrollingCapture) printf '%s\n%s\n' menu.file menu.file.captureScrolling ;;
+	recordWindow) printf '%s\n%s\n' menu.file menu.file.recordWindow ;;
+	recordArea) printf '%s\n%s\n' menu.file menu.file.recordArea ;;
+	recordDisplay) printf '%s\n%s\n' menu.file menu.file.recordDisplay ;;
+	stopRecording) printf '%s\n%s\n' menu.file menu.file.stopRecording ;;
+	captureBar) printf '%s\n%s\n' menu.file menu.file.captureBar ;;
+	screenshotHistory) printf '%s\n%s\n' menu.file menu.file.screenshotHistory ;;
+	recordingHistory) printf '%s\n%s\n' menu.file menu.file.previousProjects ;;
+	*) return 1 ;;
+	esac
+}
+
+KEYS=$(menu_keys "$ACTION") || {
+	echo "screenflare-menu: unknown action '$ACTION' (try --help)" >&2
+	exit 1
+}
+BAR_KEY=$(printf '%s\n' "$KEYS" | sed -n 1p)
+ITEM_KEY=$(printf '%s\n' "$KEYS" | sed -n 2p)
+
+# ── Localization ─────────────────────────────────────────────────────────────
+
+# AppleScript list output: ("en-US","zh-Hans-US") → one tag per line.
+parse_lang_list() {
+	tr -d '()"' | tr ',' '\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' -e '/^System$/d'
+}
+
+preferred_languages() {
+	per_app=$(defaults read "$BUNDLE_ID" AppleLanguages 2>/dev/null || true)
+	tags=$(printf '%s\n' "$per_app" | parse_lang_list)
+	[ -n "$tags" ] || tags=$(defaults read -g AppleLanguages 2>/dev/null | parse_lang_list)
+	printf '%s\n' "$tags"
+}
+
+available_languages() {
+	"$PLUTIL" -extract CFBundleLocalizations json -o - "$APP/Contents/Info.plist" 2>/dev/null |
+		tr -d '[]"' | tr ',' '\n' | sed -e '/^[[:space:]]*$/d'
+}
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+select_language() {
+	available=$1
+	for tag in $(preferred_languages); do
+		case $tag in
+		*-*-*) candidates="$tag $(printf '%s' "$tag" | sed 's/-[^-]*$//') ${tag%%-*}" ;;
+		*-*) candidates="$tag ${tag%%-*}" ;;
+		*) candidates=$tag ;;
+		esac
+		for candidate in $candidates; do
+			for entry in $available; do
+				[ "$(lower "$candidate")" = "$(lower "$entry")" ] && { printf '%s\n' "$entry"; return 0; }
+			done
+		done
+	done
+	for entry in $available; do
+		[ "$(lower "$entry")" = en ] && { printf 'en\n'; return 0; }
+	done
+	printf '%s\n' "$available" | sed -n 1p
+}
+
+# plutil key paths use '.' as a separator, so the literal dots need escaping.
+strings_key() { printf '%s\n' "$1" | sed 's/\./\\./g'; }
+
+title_for() { # language, key
+	"$PLUTIL" -extract "$(strings_key "$2")" raw -o - "$RES/$1.lproj/Localizable.strings" 2>/dev/null || true
+}
+
+AVAILABLE=$(available_languages)
+LANGUAGE=$(select_language "$AVAILABLE")
+[ -n "$LANGUAGE" ] || LANGUAGE=en
+
+title() {
+	text=$(title_for "$LANGUAGE" "$1")
+	[ -n "$text" ] || text=$(title_for en "$1")
+	[ -n "$text" ] || {
+		echo "screenflare-menu: no menu title for '$1' in $APP" >&2
+		exit 1
+	}
+	printf '%s\n' "$text"
+}
+
+BAR_TITLE=$(title "$BAR_KEY")
+ITEM_TITLE=$(title "$ITEM_KEY")
+LABEL="$BAR_TITLE ▸ $ITEM_TITLE"
+
+# ── AppleScript helpers ─────────────────────────────────────────────────────
+
+as_string() { printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"; }
+
+notify() {
+	"$OSASCRIPT" -e "display notification $(as_string "$1") with title \"Screenflare\"" >/dev/null 2>&1 || true
+}
+
+fail() {
+	echo "screenflare-menu: $*" >&2
+	notify "$*"
+	exit 1
+}
+
+is_running() {
+	"$OSASCRIPT" -e "tell application \"System Events\" to return (count of (every process whose bundle identifier is \"$BUNDLE_ID\")) > 0" 2>/dev/null |
+		grep -qx true
+}
+
+ensure_running() {
+	is_running && return 0
+	open -g -a "$APP" || fail "could not launch $APP"
+	attempt=0
+	while [ "$attempt" -lt 50 ]; do
+		is_running && return 0
+		sleep 0.2
+		attempt=$((attempt + 1))
+	done
+	fail "Screenflare did not start from $APP"
+}
+
+# One System Events script; $2 is the clause to run once the item is reachable.
+ui_script() { # language-independent: computed titles are passed in
+	"$OSASCRIPT" -e "tell application \"System Events\" to tell process \"Screenflare\"" \
+		-e "set bar to menu bar item $(as_string "$BAR_TITLE") of menu bar 1" \
+		-e "set target to menu item $(as_string "$ITEM_TITLE") of menu 1 of bar" \
+		-e 'if not (exists target) then error "menu item not found"' \
+		-e "$1" \
+		-e 'end tell'
+}
+
+# Screenflare may still be populating its menus right after launch.
+wait_for_menu() {
+	deadline=$((WAIT * 5))
+	attempt=0
+	while [ "$attempt" -lt "$deadline" ]; do
+		if out=$("$OSASCRIPT" -e "tell application \"System Events\" to tell process \"Screenflare\"" \
+			-e "set bar to menu bar item $(as_string "$BAR_TITLE") of menu bar 1" \
+			-e "set target to menu item $(as_string "$ITEM_TITLE") of menu 1 of bar" \
+			-e 'return exists target' \
+			-e 'end tell' 2>&1); then
+			[ "$out" = true ] && return 0
+		else
+			case $out in
+			*-1743* | *"-1719"* | *"not allowed"* | *"not authorized"* | *"assistive access"*)
+				fail "$out (grant OpenLogi Accessibility and Automation for System Events)"
+				;;
+			esac
+		fi
+		sleep 0.2
+		attempt=$((attempt + 1))
+	done
+	fail "Screenflare did not show '$LABEL'"
+}
+
+ensure_running
+wait_for_menu
+
+if [ "$CHECK" -eq 1 ]; then
+	enabled=$(ui_script 'return enabled of target') || fail "could not read '$LABEL'"
+	if [ "$enabled" = true ]; then
+		printf '%s\t%s\t%s\n' "$ACTION" "$LABEL" "enabled"
+		exit 0
+	fi
+	printf '%s\t%s\t%s\n' "$ACTION" "$LABEL" "disabled"
+	exit 1
+fi
+
+"$OSASCRIPT" -e "tell application \"System Events\" to tell process \"Screenflare\"" \
+	-e "set bar to menu bar item $(as_string "$BAR_TITLE") of menu bar 1" \
+	-e "set target to menu item $(as_string "$ITEM_TITLE") of menu 1 of bar" \
+	-e "if not (enabled of target) then error $(as_string "$LABEL is unavailable right now")" \
+	-e 'click target' \
+	-e 'end tell' >/dev/null || fail "could not click '$LABEL'"
