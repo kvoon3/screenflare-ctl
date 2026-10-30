@@ -139,7 +139,7 @@ In the GUI the same thing is: button → *Run Shell Command*; ring slot → *Run
 Command*, then set the slot's label and one of the ring glyphs (`Camera`,
 `Monitor`, `Search`, `Terminal`, `Grid`, …). Prefer authoring in OpenLogi's own UI:
 its config writer re-flows hand-edited inline tables, so a hand edit can land as
-invalid TOML (see `~/playground/my-mouse/README.md`).
+invalid TOML. Bind through its button and ring editors.
 
 ### Always pass `--no-wait` from OpenLogi
 
