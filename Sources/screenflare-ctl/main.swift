@@ -34,7 +34,10 @@ import Darwin
 import Foundation
 
 let schemaVersion = 1
-let bundleID = "app.screenflare"
+/// Screenflare's bundle id. A locally rebuilt copy (`screenflarex`) carries
+/// `app.screenflare.x`, so both are accepted: whichever is running is the one to drive.
+let bundleIDs = ["app.screenflare.x", "app.screenflare"]
+let bundleID = bundleIDs[0]
 let appPath = "/Applications/Screenflare.app"
 let infoPlistPath = appPath + "/Contents/Info.plist"
 let resourcesPath = appPath + "/Contents/Resources"
@@ -220,18 +223,32 @@ func readMenus(of bar: AXUIElement) -> [Menu] {
 // MARK: - Target
 
 struct Target {
+    let bundleIdentifier: String
     let pid: pid_t
+    /// Where the running bundle actually lives: the original app, or a rebuilt copy the
+    /// user keeps elsewhere. Everything file-based (Localizable.strings, Info.plist) has
+    /// to come from here, not from the installed path.
+    let bundleURL: URL
     let ax: AXUIElement
+
+    var resourcesPath: String { bundleURL.appendingPathComponent("Contents/Resources").path }
+    var infoPlistPath: String { bundleURL.appendingPathComponent("Contents/Info.plist").path }
 }
 
-func appVersion() -> String {
+func appVersion(_ infoPlistPath: String = infoPlistPath) -> String {
     (NSDictionary(contentsOfFile: infoPlistPath)?["CFBundleShortVersionString"] as? String) ?? "unknown"
 }
 
 func runningTarget() -> Target? {
-    guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundleID })
-    else { return nil }
-    return Target(pid: app.processIdentifier, ax: AXUIElementCreateApplication(app.processIdentifier))
+    let apps = NSWorkspace.shared.runningApplications
+    for identifier in bundleIDs {
+        if let app = apps.first(where: { $0.bundleIdentifier == identifier }) {
+            return Target(bundleIdentifier: identifier, pid: app.processIdentifier,
+                          bundleURL: app.bundleURL ?? URL(fileURLWithPath: appPath),
+                          ax: AXUIElementCreateApplication(app.processIdentifier))
+        }
+    }
+    return nil
 }
 
 func menuBar(of target: Target) -> AXUIElement? {
@@ -245,15 +262,16 @@ func preferencesArray(_ key: String, domain: CFString) -> [String] {
     (CFPreferencesCopyAppValue(key as CFString, domain) as? [String]) ?? []
 }
 
-func bundleLocalizations() -> [String] {
+func bundleLocalizations(_ infoPlistPath: String = infoPlistPath) -> [String] {
     (NSDictionary(contentsOfFile: infoPlistPath)?["CFBundleLocalizations"] as? [String]) ?? ["en"]
 }
 
 /// The language Screenflare actually renders: per-app override, then global, then system.
-func effectiveLanguage() -> String {
-    let available = bundleLocalizations()
+func effectiveLanguage(for identifier: String = bundleID, infoPlistPath: String = infoPlistPath,
+                       resourcesPath: String = resourcesPath) -> String {
+    let available = bundleLocalizations(infoPlistPath)
     var candidates: [String] = []
-    candidates += preferencesArray("AppleLanguages", domain: bundleID as CFString)
+    candidates += preferencesArray("AppleLanguages", domain: identifier as CFString)
     candidates += preferencesArray("AppleLanguages", domain: kCFPreferencesAnyApplication)
     candidates += Locale.preferredLanguages
     for candidate in candidates {
@@ -263,7 +281,7 @@ func effectiveLanguage() -> String {
     return available.first ?? "en"
 }
 
-func loadStrings(_ language: String) -> [String: String] {
+func loadStrings(_ language: String, resourcesPath: String = resourcesPath) -> [String: String] {
     let path = "\(resourcesPath)/\(language).lproj/Localizable.strings"
     guard FileManager.default.fileExists(atPath: path) else { return [:] }
     let process = Process()
@@ -284,10 +302,11 @@ struct Strings {
     func callAsFunction(_ key: String) -> String? { table[key] }
 }
 
-func currentStrings() -> Strings {
-    let language = effectiveLanguage()
-    var table = loadStrings(language)
-    if table.isEmpty { table = loadStrings("en") }
+func currentStrings(for identifier: String = bundleID, infoPlistPath: String = infoPlistPath,
+                    resourcesPath: String = resourcesPath) -> Strings {
+    let language = effectiveLanguage(for: identifier, infoPlistPath: infoPlistPath, resourcesPath: resourcesPath)
+    var table = loadStrings(language, resourcesPath: resourcesPath)
+    if table.isEmpty { table = loadStrings("en", resourcesPath: resourcesPath) }
     return Strings(language: language, table: table)
 }
 
@@ -466,14 +485,15 @@ func statePayload(_ target: Target?, _ resolver: Resolver?) -> [String: Any] {
     if let target { state["pid"] = Int(target.pid) }
     state["recording"] = resolver?.stopEnabled() ?? false
     state["paused"] = resolver?.paused() ?? false
-    state["language"] = resolver?.strings.language ?? currentStrings().language
+    state["language"] = resolver?.strings.language ?? bundleID
     return state
 }
 
 func connect() -> (Target, Resolver) {
     guard let target = runningTarget() else {
-        fail("app_not_running", "Screenflare is not running.",
-             hint: "Launch it with: open -g -a \(appPath)", exit: .notRunning,
+        fail("app_not_running", "No Screenflare or ScreenflareX is running.",
+             hint: "Launch one: open -g -a \(appPath)  — or a rebuilt copy at ~/Applications/ScreenflareX.app",
+             exit: .notRunning,
              extra: ["state": statePayload(nil, nil)])
     }
     guard let bar = menuBar(of: target) else {
@@ -481,7 +501,11 @@ func connect() -> (Target, Resolver) {
              hint: "Allow the calling app (Raycast / Terminal / OpenLogi) in System Settings ▸ Privacy & Security ▸ Accessibility.",
              exit: .accessDenied, extra: ["state": statePayload(target, nil)])
     }
-    let resolver = Resolver(target: target, strings: currentStrings(), menus: readMenus(of: bar))
+    let resolver = Resolver(
+        target: target,
+        strings: currentStrings(for: target.bundleIdentifier, infoPlistPath: target.infoPlistPath,
+                               resourcesPath: target.resourcesPath),
+        menus: readMenus(of: bar))
     return (target, resolver)
 }
 
