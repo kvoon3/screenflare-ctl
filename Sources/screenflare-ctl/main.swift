@@ -520,7 +520,7 @@ func runDoctor() {
     var report: [String: Any] = [
         "axTrusted": AXIsProcessTrusted(),
         "appPath": appPath,
-        "appVersion": appVersion(),
+        "appVersion": appVersion(runningTarget()?.infoPlistPath ?? infoPlistPath),
         "language": currentStrings().language,
         "bundleLocalizations": bundleLocalizations(),
         "screenshotsFolder": screenshotsFolder(),
@@ -536,7 +536,7 @@ func runDoctor() {
     report["state"] = statePayload(target, resolver)
 
     let human = """
-    Screenflare \(appVersion())  pid \(target.pid)  language \(resolver.strings.language)  AX \(AXIsProcessTrusted() ? "trusted" : "not trusted")
+    Screenflare \(appVersion(target.infoPlistPath))  pid \(target.pid)  language \(resolver.strings.language)  AX \(AXIsProcessTrusted() ? "trusted" : "not trusted")
     screenshots  \(screenshotsFolder())
     recordings   \(recordingsFolder())
     actions      \(capabilities.count - unresolved.count)/\(capabilities.count) resolved\(unresolved.isEmpty ? "" : " (unresolved: \(unresolved.joined(separator: ", ")))")
